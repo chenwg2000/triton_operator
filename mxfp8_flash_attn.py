@@ -2,10 +2,9 @@
 MXfp8 Flash Attention for SM120 (RTX 5090)
 
 Uses E4M3 data + E8M0 per-block scales (32 elements per block) with
-tl.dot_scaled for the QK^T and PV matmuls in the forward pass.
-Backward pass uses standard FP16 tl.dot for numerical stability.
+tl.dot_scaled for all matmuls in both forward and backward passes.
 
-Accepts FP16 [B, H, N, D] inputs. Quantizes to MXfp8 on-the-fly inside kernels.
+Accepts BF16 [B, S, H, D] inputs. Quantizes to MXfp8 on-the-fly inside kernels.
 """
 
 import torch
@@ -193,25 +192,27 @@ def _mxfp8_attn_fwd(
 
 
 # =====================================================================
-# Backward Kernels (FP16 tl.dot for numerical stability)
+# Backward Kernels (MXfp8 tl.dot_scaled)
 # =====================================================================
 
 @triton.jit
 def _attn_bwd_preprocess(
     O, DO, Delta,
-    Z, H, N_CTX,
+    stride_z, stride_h, stride_tok, stride_d,
+    H, N_CTX,
     BLOCK_M: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
     """Compute Delta[i] = rowsum(O[i] * dO[i])."""
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
     offs_d = tl.arange(0, HEAD_DIM)
 
-    # Assumes contiguous [B*H, N, D] layout
-    base = off_hz * N_CTX * HEAD_DIM
-    o = tl.load(O + base + off_m[:, None] * HEAD_DIM + offs_d[None, :])
-    do = tl.load(DO + base + off_m[:, None] * HEAD_DIM + offs_d[None, :]).to(tl.float32)
+    base = off_z.to(tl.int64) * stride_z + off_h.to(tl.int64) * stride_h
+    o = tl.load(O + base + off_m[:, None] * stride_tok + offs_d[None, :] * stride_d)
+    do = tl.load(DO + base + off_m[:, None] * stride_tok + offs_d[None, :] * stride_d).to(tl.float32)
     delta = tl.sum(o * do, axis=1)
     tl.store(Delta + off_hz * N_CTX + off_m, delta)
 
@@ -239,13 +240,20 @@ def _attn_bwd_dkdv(
     tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
     curr_m = start_m
 
+    # Hoist k and v row quantization (reused every iteration)
+    k_fp8, k_scale = _quantize_mxfp8_row(k.to(tl.float32), BLOCK_N1, HEAD_DIM)
+    v_fp8, v_scale = _quantize_mxfp8_row(v.to(tl.float32), BLOCK_N1, HEAD_DIM)
+
     for blk_idx in range(num_steps):
         qT = tl.load(qT_ptrs)
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
         m = tl.load(M + offs_m)
 
-        # Recompute attention: k is pre-scaled by sm_scale/ln2
-        qkT = tl.dot(k, qT)
+        # Dot 1: qkT = k @ qT  [N1,HD] @ [HD,M1]
+        qT_f32 = qT.to(tl.float32)
+        qT_col_fp8, qT_col_scale = _quantize_mxfp8_col(qT_f32, HEAD_DIM, BLOCK_M1)
+        qkT = tl.dot_scaled(k_fp8, k_scale, "e4m3",
+                             qT_col_fp8, qT_col_scale, "e4m3")
         pT = tl.math.exp2(qkT - m[None, :])
 
         if MASK:
@@ -253,15 +261,26 @@ def _attn_bwd_dkdv(
             pT = tl.where(mask, pT, 0.0)
 
         do = tl.load(do_ptrs)
+        do_f32 = do.to(tl.float32)
 
-        # dV += P^T @ dO
-        dv += tl.dot(pT.to(tl.float16), do)
+        # Dot 2: dV += P^T @ dO  [N1,M1] @ [M1,HD]
+        pT_fp8, pT_scale = _quantize_mxfp8_row(pT, BLOCK_N1, BLOCK_M1)
+        do_col_fp8, do_col_scale = _quantize_mxfp8_col(do_f32, BLOCK_M1, HEAD_DIM)
+        dv = tl.dot_scaled(pT_fp8, pT_scale, "e4m3",
+                           do_col_fp8, do_col_scale, "e4m3", dv)
 
-        # dK += dS^T @ Q
+        # Dot 3: dpT = v @ trans(do)  [N1,HD] @ [HD,M1]
         Di = tl.load(D + offs_m)
-        dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
+        do_row_fp8, do_row_scale = _quantize_mxfp8_row(do_f32, BLOCK_M1, HEAD_DIM)
+        dpT = tl.dot_scaled(v_fp8, v_scale, "e4m3",
+                            tl.trans(do_row_fp8), do_row_scale, "e4m3")
         dsT = pT * (dpT - Di[None, :])
-        dk += tl.dot(dsT.to(tl.float16), tl.trans(qT))
+
+        # Dot 4: dK += dS^T @ trans(qT)  [N1,M1] @ [M1,HD]
+        dsT_fp8, dsT_scale = _quantize_mxfp8_row(dsT, BLOCK_N1, BLOCK_M1)
+        qT_row_fp8, qT_row_scale = _quantize_mxfp8_row(qT_f32, HEAD_DIM, BLOCK_M1)
+        dk = tl.dot_scaled(dsT_fp8, dsT_scale, "e4m3",
+                           tl.trans(qT_row_fp8), qT_row_scale, "e4m3", dk)
 
         curr_m += BLOCK_M1
         qT_ptrs += BLOCK_M1 * stride_tok
@@ -293,12 +312,19 @@ def _attn_bwd_dq(
     tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
     curr_n = start_n
 
+    # Hoist q and do row quantization (reused every iteration)
+    q_fp8, q_scale = _quantize_mxfp8_row(q.to(tl.float32), BLOCK_M2, HEAD_DIM)
+    do_fp8, do_scale = _quantize_mxfp8_row(do.to(tl.float32), BLOCK_M2, HEAD_DIM)
+
     for blk_idx in range(num_steps):
         kT = tl.load(kT_ptrs)
         vT = tl.load(vT_ptrs)
+        kT_f32 = kT.to(tl.float32)
 
-        # Recompute attention (k is pre-scaled)
-        qk = tl.dot(q, kT)
+        # Dot 1: qk = q @ kT  [M2,HD] @ [HD,N2]
+        kT_col_fp8, kT_col_scale = _quantize_mxfp8_col(kT_f32, HEAD_DIM, BLOCK_N2)
+        qk = tl.dot_scaled(q_fp8, q_scale, "e4m3",
+                           kT_col_fp8, kT_col_scale, "e4m3")
         p = tl.math.exp2(qk - m)
 
         if MASK:
@@ -306,12 +332,17 @@ def _attn_bwd_dq(
             mask = offs_m[:, None] >= offs_n[None, :]
             p = tl.where(mask, p, 0.0)
 
-        # dP = dO @ V^T
-        dp = tl.dot(do, vT).to(tl.float32)
+        # Dot 2: dp = do @ vT  [M2,HD] @ [HD,N2]
+        vT_col_fp8, vT_col_scale = _quantize_mxfp8_col(vT.to(tl.float32), HEAD_DIM, BLOCK_N2)
+        dp = tl.dot_scaled(do_fp8, do_scale, "e4m3",
+                           vT_col_fp8, vT_col_scale, "e4m3")
         ds = p * (dp - Di[:, None])
 
-        # dQ += dS @ K (using pre-scaled K)
-        dq += tl.dot(ds.to(tl.float16), tl.trans(kT))
+        # Dot 3: dQ += dS @ trans(kT)  [M2,N2] @ [N2,HD]
+        ds_fp8, ds_scale = _quantize_mxfp8_row(ds, BLOCK_M2, BLOCK_N2)
+        kT_row_fp8, kT_row_scale = _quantize_mxfp8_row(kT_f32, HEAD_DIM, BLOCK_N2)
+        dq = tl.dot_scaled(ds_fp8, ds_scale, "e4m3",
+                           tl.trans(kT_row_fp8), kT_row_scale, "e4m3", dq)
 
         curr_n += BLOCK_N2
         kT_ptrs += BLOCK_N2 * stride_tok
@@ -444,10 +475,10 @@ class MXfp8FlashAttention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale):
-        # q, k, v: [B, H, N, D] in float16
-        B, H, N, D = q.shape
+        # q, k, v: [B, S, H, D] in bfloat16
+        B, S, H, D = q.shape
         assert D in {64, 128}, f"HEAD_DIM must be 64 or 128, got {D}"
-        assert N % 128 == 0, f"N_CTX must be a multiple of 128, got {N}"
+        assert S % 128 == 0, f"N_CTX must be a multiple of 128, got {S}"
 
         # Ensure contiguous for uniform strides in backward
         q = q.contiguous()
@@ -458,17 +489,19 @@ class MXfp8FlashAttention(torch.autograd.Function):
         BLOCK_N = 64
 
         o = torch.empty_like(q)
-        lse = torch.empty((B, H, N), device=q.device, dtype=torch.float32)
+        lse = torch.empty((B, H, S), device=q.device, dtype=torch.float32)
 
-        grid = (triton.cdiv(N, BLOCK_M), B * H)
+        grid = (triton.cdiv(S, BLOCK_M), B * H)
 
+        # Strides: kernel expects (batch, head, seq, dim)
+        # [B, S, H, D] layout: dim0=batch, dim1=seq, dim2=head, dim3=dim
         _mxfp8_attn_fwd[grid](
             q, k, v, sm_scale, o, lse,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            B, H, N,
+            q.stride(0), q.stride(2), q.stride(1), q.stride(3),
+            k.stride(0), k.stride(2), k.stride(1), k.stride(3),
+            v.stride(0), v.stride(2), v.stride(1), v.stride(3),
+            o.stride(0), o.stride(2), o.stride(1), o.stride(3),
+            B, H, S,
             HEAD_DIM=D,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
@@ -486,7 +519,7 @@ class MXfp8FlashAttention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         q, k, v, o, lse = ctx.saved_tensors
-        B, H, N, D = q.shape
+        B, S, H, D = q.shape
 
         do = do.contiguous()
         assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
@@ -497,12 +530,13 @@ class MXfp8FlashAttention(torch.autograd.Function):
 
         # Preprocess: Delta = rowsum(O * dO)
         PRE_BLOCK = 128
-        pre_grid = (N // PRE_BLOCK, B * H)
+        pre_grid = (S // PRE_BLOCK, B * H)
         delta = torch.empty_like(lse)
 
         _attn_bwd_preprocess[pre_grid](
             o, do, delta,
-            B, H, N,
+            o.stride(0), o.stride(2), o.stride(1), o.stride(3),
+            H, S,
             BLOCK_M=PRE_BLOCK, HEAD_DIM=D,
         )
 
@@ -512,16 +546,18 @@ class MXfp8FlashAttention(torch.autograd.Function):
 
         BLOCK_M1, BLOCK_N1 = 32, 128
         BLOCK_M2, BLOCK_N2 = 128, 32
-        BLK_SLICE_FACTOR = 2
+        BLK_SLICE_FACTOR = 1  # MXfp8 needs contraction dim >= 32
 
-        grid = (N // BLOCK_N1, 1, B * H)
+        grid = (S // BLOCK_N1, 1, B * H)
 
+        # Strides: kernel expects (batch, head, seq, dim)
+        # [B, S, H, D] layout: dim0=batch, dim1=seq, dim2=head, dim3=dim
         _attn_bwd[grid](
             q, k_scaled, v, ctx.sm_scale,
             do, dq, dk, dv,
             lse, delta,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            H, N,
+            q.stride(0), q.stride(2), q.stride(1), q.stride(3),
+            H, S,
             BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,
             BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
@@ -538,12 +574,12 @@ def mxfp8_flash_attention(q, k, v, causal=False, sm_scale=None):
     """MXfp8 Flash Attention.
 
     Args:
-        q, k, v: [B, H, N, D] float16 tensors
+        q, k, v: [B, S, H, D] bfloat16 tensors
         causal: whether to apply causal masking
         sm_scale: softmax scale (default: 1/sqrt(D))
 
     Returns:
-        output: [B, H, N, D] float16
+        output: [B, S, H, D] bfloat16
     """
     if sm_scale is None:
         sm_scale = q.shape[-1] ** -0.5

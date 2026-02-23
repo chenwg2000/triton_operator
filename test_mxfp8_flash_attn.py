@@ -7,7 +7,7 @@ element, which accumulates across dot-product dimensions.  Reference Triton
 flash attention uses atol=3 for E5M2 FP8.  Our MXfp8 (E4M3 + per-32-block
 E8M0 scaling) is slightly more precise, so we use:
   - Forward: atol=2.0
-  - Backward: atol=8.0  (forward quantization mismatch + FP16 backward)
+  - Backward: atol=8.0  (forward quantization mismatch + MXfp8 backward)
 """
 
 import torch
@@ -19,18 +19,26 @@ DEVICE = "cuda"
 
 
 def reference_attention(q, k, v, causal=False, sm_scale=None):
-    """Standard multi-head attention in FP32 for reference."""
+    """Standard multi-head attention in FP32 for reference.
+
+    Accepts [B, S, H, D] bfloat16 inputs, permutes to [B, H, S, D] for
+    matmul, then permutes back.
+    """
     if sm_scale is None:
         sm_scale = q.shape[-1] ** -0.5
-    # Compute in float32 for accuracy
-    s = torch.matmul(q.float(), k.float().transpose(-2, -1)) * sm_scale
+    # Permute [B, S, H, D] -> [B, H, S, D] for matmul
+    q_ = q.float().permute(0, 2, 1, 3)
+    k_ = k.float().permute(0, 2, 1, 3)
+    v_ = v.float().permute(0, 2, 1, 3)
+    s = torch.matmul(q_, k_.transpose(-2, -1)) * sm_scale
     if causal:
-        N = q.shape[-2]
+        N = q_.shape[-2]
         mask = torch.tril(torch.ones(N, N, device=q.device, dtype=torch.bool))
         s = s.masked_fill(~mask, float("-inf"))
     p = torch.softmax(s, dim=-1)
-    o = torch.matmul(p, v.float())
-    return o.half()
+    o = torch.matmul(p, v_)
+    # Permute [B, H, S, D] -> [B, S, H, D]
+    return o.permute(0, 2, 1, 3).to(torch.bfloat16)
 
 
 def test_forward():
@@ -50,9 +58,9 @@ def test_forward():
                         torch.manual_seed(42)
                         sm_scale = 0.5
 
-                        q = torch.empty(B, H, N, D, device=DEVICE, dtype=torch.float16).normal_(mean=0., std=0.5)
-                        k = torch.empty(B, H, N, D, device=DEVICE, dtype=torch.float16).normal_(mean=0., std=0.5)
-                        v = torch.empty(B, H, N, D, device=DEVICE, dtype=torch.float16).normal_(mean=0., std=0.5)
+                        q = torch.empty(B, N, H, D, device=DEVICE, dtype=torch.bfloat16).normal_(mean=0., std=0.5)
+                        k = torch.empty(B, N, H, D, device=DEVICE, dtype=torch.bfloat16).normal_(mean=0., std=0.5)
+                        v = torch.empty(B, N, H, D, device=DEVICE, dtype=torch.bfloat16).normal_(mean=0., std=0.5)
 
                         ref = reference_attention(q, k, v, causal, sm_scale)
                         out = mxfp8_flash_attention(q, k, v, causal, sm_scale)
@@ -93,11 +101,11 @@ def test_backward():
                         sm_scale = 0.5
 
                         # Reference
-                        q_ref = torch.empty(B, H, N, D, device=DEVICE, dtype=torch.float16
+                        q_ref = torch.empty(B, N, H, D, device=DEVICE, dtype=torch.bfloat16
                                             ).normal_(mean=0., std=0.5).requires_grad_(True)
-                        k_ref = torch.empty(B, H, N, D, device=DEVICE, dtype=torch.float16
+                        k_ref = torch.empty(B, N, H, D, device=DEVICE, dtype=torch.bfloat16
                                             ).normal_(mean=0., std=0.5).requires_grad_(True)
-                        v_ref = torch.empty(B, H, N, D, device=DEVICE, dtype=torch.float16
+                        v_ref = torch.empty(B, N, H, D, device=DEVICE, dtype=torch.bfloat16
                                             ).normal_(mean=0., std=0.5).requires_grad_(True)
 
                         ref_out = reference_attention(q_ref, k_ref, v_ref, causal, sm_scale)
